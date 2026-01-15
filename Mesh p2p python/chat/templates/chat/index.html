@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mesh P2P</title>
+    <style>
+        /* CSS STYLES */
+        body { 
+            background-color: #121212; 
+            color: white; 
+            font-family: 'Courier New', Courier, monospace; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            margin: 0;
+            padding: 20px; 
+        }
+
+        h1 { margin-bottom: 5px; }
+
+        #status-bar {
+            padding: 10px 20px;
+            background: #333;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            font-weight: bold;
+            border: 1px solid #555;
+        }
+
+        #video-grid { 
+            display: flex; 
+            flex-wrap: wrap; 
+            gap: 20px; 
+            width: 100%; 
+            justify-content: center; 
+            margin-bottom: 30px;
+        }
+        
+        /* Video Container Styling */
+        .video-wrapper { 
+            position: relative; 
+            width: 320px; 
+            height: 240px; 
+            background: #000;
+            border: 2px solid #444;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        video { 
+            width: 100%; 
+            height: 100%; 
+            object-fit: cover; 
+            transform: scaleX(-1); /* Mirror effect */
+        }
+
+        .label { 
+            position: absolute; 
+            bottom: 5px; 
+            left: 5px; 
+            background: rgba(0,0,0,0.6); 
+            color: white; 
+            padding: 4px 8px; 
+            font-size: 12px; 
+            border-radius: 4px;
+        }
+
+        /* Log Console Styling */
+        #console-box { 
+            width: 90%; 
+            max-width: 800px;
+            height: 200px; 
+            overflow-y: scroll; 
+            background: #000; 
+            border: 1px solid #333; 
+            padding: 10px; 
+            font-size: 11px; 
+            color: #ccc;
+        }
+        .log-success { color: #4caf50; } /* Green */
+        .log-error { color: #ff5252; }   /* Red */
+        .log-info { color: #64b5f6; }    /* Blue */
+        .log-warn { color: #ffb74d; }    /* Orange */
+    </style>
+</head>
+<body>
+
+    <h1>Mesh P2P Video</h1>
+    <div id="status-bar">System Status: <span id="status-text" style="color: yellow">Initializing...</span></div>
+
+    <div id="video-grid"></div>
+
+    <h3>Live Logs</h3>
+    <div id="console-box"></div>
+
+    <script>
+        // --- 1. GLOBAL VARIABLES ---
+        const loc = window.location;
+        const wsStart = loc.protocol === 'https:' ? 'wss://' : 'ws://';
+        const socket = new WebSocket(wsStart + loc.host + '/ws/video/');
+        
+        const videoGrid = document.getElementById('video-grid');
+        const consoleBox = document.getElementById('console-box');
+        const statusText = document.getElementById('status-text');
+
+        const peers = {};            // Store PeerConnections
+        const iceCandidatesQueue = {}; // Queue for early candidates
+        
+        const myVideo = document.createElement('video');
+        myVideo.muted = true; // Always mute self
+        let myStream = null;
+        let streamReady = false; // Track if stream is ready
+
+        // Use Google's Public STUN Server
+        const iceConfiguration = {
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        };
+
+        // --- 2. LOGGING FUNCTION ---
+        function log(msg, type = 'normal') {
+            const div = document.createElement('div');
+            div.innerHTML = `<span style="color:#777">[${new Date().toLocaleTimeString()}]</span> ${msg}`;
+            if(type === 'success') div.className = 'log-success';
+            if(type === 'error') div.className = 'log-error';
+            if(type === 'info') div.className = 'log-info';
+            consoleBox.prepend(div);
+            console.log(msg);
+        }
+
+        // --- 3. INITIALIZATION ---
+        log("🚀 App Starting...");
+        
+        navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        .then(stream => {
+            log("✅ Camera & Audio Access Granted", "success");
+            myStream = stream;
+            streamReady = true;
+            
+            // Ensure audio tracks are enabled
+            const audioTracks = stream.getAudioTracks();
+            audioTracks.forEach(track => {
+                track.enabled = true;
+                log(`🔊 Audio track enabled: ${track.label || track.kind}`, "success");
+            });
+            
+            // Log video tracks too
+            const videoTracks = stream.getVideoTracks();
+            videoTracks.forEach(track => {
+                track.enabled = true;
+                log(`🎥 Video track enabled: ${track.label || track.kind}`, "success");
+            });
+            
+            addVideoStream(myVideo, stream, "You (Local)");
+            statusText.innerText = "Connected to Camera & Audio. Waiting for Server...";
+            statusText.style.color = "orange";
+        })
+        .catch(err => {
+            log("❌ Camera/Audio Error: " + err.message, "error");
+            statusText.innerText = "Camera/Audio Failed";
+            statusText.style.color = "red";
+        });
+
+        // --- 4. WEBSOCKET HANDLERS ---
+        socket.onopen = () => {
+            log("✅ WebSocket Connected", "success");
+            statusText.innerText = "Online - Waiting for Peers";
+            statusText.style.color = "#4caf50";
+        };
+
+        socket.onerror = (e) => log("❌ WebSocket Error", "error");
+
+        socket.onmessage = async (event) => {
+            const data = JSON.parse(event.data);
+            const user = data.callerId || data.userId || "Unknown";
+
+            try {
+                switch (data.action) {
+                    case 'user-connected':
+                        log(`👋 User Joined: ${user.substr(0, 5)}...`, "info");
+                        // As an existing user, I call the new guy
+                        // Wait for stream to be ready before connecting
+                        if (streamReady && myStream) {
+                            connectToNewUser(data.userId, myStream);
+                        } else {
+                            log("⏳ Waiting for media stream to be ready...", "warn");
+                            // Retry after a short delay
+                            setTimeout(() => {
+                                if (streamReady && myStream) {
+                                    connectToNewUser(data.userId, myStream);
+                                } else {
+                                    log("❌ Cannot connect: Media stream not available", "error");
+                                }
+                            }, 500);
+                        }
+                        break;
+                    
+                    case 'offer':
+                        log(`📩 Offer received from ${user.substr(0, 5)}...`, "info");
+                        await handleOffer(data);
+                        break;
+                    
+                    case 'answer':
+                        log(`📩 Answer received from ${user.substr(0, 5)}...`, "info");
+                        await handleAnswer(data);
+                        break;
+                    
+                    case 'ice-candidate':
+                        handleIceCandidate(data);
+                        break;
+
+                    case 'user-disconnected':
+                        log(`🚫 User Left: ${data.userId}`, "warn");
+                        if (peers[data.userId]) peers[data.userId].close();
+                        delete peers[data.userId];
+                        const el = document.getElementById(data.userId);
+                        if (el) el.remove();
+                        break;
+                }
+            } catch (err) {
+                log(`❌ Error handling ${data.action}: ${err.message}`, "error");
+                console.error(err);
+            }
+        };
+
+        // --- 5. WEBRTC FUNCTIONS ---
+        function createPeerConnection(targetId, stream) {
+            log(`⚙️ New PeerConnection -> ${targetId.substr(0, 5)}...`);
+            const pc = new RTCPeerConnection(iceConfiguration);
+
+            if (stream) {
+                // Add all tracks (both audio and video) to the peer connection
+                stream.getTracks().forEach(track => {
+                    pc.addTrack(track, stream);
+                    log(`📡 Added ${track.kind} track to peer connection`, "info");
+                });
+                
+                // Ensure audio tracks are enabled
+                const audioTracks = stream.getAudioTracks();
+                audioTracks.forEach(track => {
+                    track.enabled = true;
+                });
+            }
+
+            pc.onicecandidate = event => {
+                if (event.candidate) {
+                    sendSignal('ice-candidate', {
+                        target: targetId,
+                        candidate: event.candidate
+                    });
+                }
+            };
+
+            pc.ontrack = event => {
+                log(`📺 Media Stream Arrived from ${targetId.substr(0, 5)}... (${event.track.kind})`, "success");
+                const existing = document.getElementById(targetId);
+                
+                // Check if we already have a video element for this peer
+                let videoElement = existing ? existing.querySelector('video') : null;
+                
+                if (!videoElement) {
+                    // Create new video element for this peer (first track received)
+                    videoElement = document.createElement('video');
+                    // Unmute to hear audio from remote peers
+                    videoElement.muted = false;
+                    videoElement.setAttribute('playsinline', 'playsinline');
+                    videoElement.setAttribute('autoplay', 'autoplay');
+                    
+                    // Set up click handler for mute/unmute
+                    videoElement.addEventListener('click', () => {
+                        videoElement.muted = !videoElement.muted;
+                        log(videoElement.muted ? "🔇 Muted" : "🔊 Unmuted", "info");
+                    });
+                    
+                    // Set up play handler to ensure audio works
+                    const playHandler = () => {
+                        videoElement.play().then(() => {
+                            log(`✅ Playing media from ${targetId.substr(0, 5)}...`, "success");
+                            // Ensure audio is unmuted after play starts
+                            videoElement.muted = false;
+                        }).catch(e => {
+                            log(`❌ Play error: ${e.message}`, "error");
+                        });
+                    };
+                    
+                    videoElement.addEventListener('loadedmetadata', playHandler);
+                    
+                    // Add video element to DOM
+                    addVideoStream(videoElement, event.streams[0], "Peer", targetId);
+                } else {
+                    // Update existing video element with new stream (if different)
+                    if (event.streams && event.streams[0] && videoElement.srcObject !== event.streams[0]) {
+                        videoElement.srcObject = event.streams[0];
+                    }
+                }
+                
+                // Log audio track information
+                if (event.track.kind === 'audio') {
+                    log(`🔊 Audio track received from ${targetId.substr(0, 5)}...`, "success");
+                    event.track.onended = () => {
+                        log(`🔇 Audio track ended from ${targetId.substr(0, 5)}...`, "warn");
+                    };
+                    // Ensure audio track is enabled
+                    if (event.track.enabled === false) {
+                        event.track.enabled = true;
+                        log(`🔊 Enabled audio track from ${targetId.substr(0, 5)}...`, "info");
+                    }
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                const state = pc.connectionState;
+                log(`⚡ Connection State (${targetId.substr(0,5)}): ${state}`, state === 'connected' ? 'success' : 'warn');
+            };
+
+            peers[targetId] = pc;
+            return pc;
+        }
+
+        async function connectToNewUser(userId, stream) {
+            // I am the Caller
+            if (!stream) {
+                log(`❌ Cannot connect to ${userId.substr(0, 5)}...: No stream available`, "error");
+                return;
+            }
+            
+            // Ensure stream has audio tracks
+            const audioTracks = stream.getAudioTracks();
+            if (audioTracks.length === 0) {
+                log(`⚠️ Warning: No audio tracks in stream for ${userId.substr(0, 5)}...`, "warn");
+            } else {
+                log(`🔊 Connecting with ${audioTracks.length} audio track(s)`, "info");
+            }
+            
+            const pc = createPeerConnection(userId, stream);
+            iceCandidatesQueue[userId] = []; // Reset queue
+            
+            // Create offer with audio and video
+            const offer = await pc.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true
+            });
+            await pc.setLocalDescription(offer);
+            
+            log(`📤 Sending offer to ${userId.substr(0, 5)}... with audio/video`, "info");
+            sendSignal('offer', { target: userId, sdp: offer });
+        }
+
+        async function handleOffer(payload) {
+            // I am the Receiver
+            const callerId = payload.callerId;
+            
+            if (!myStream) {
+                log(`❌ Cannot handle offer from ${callerId.substr(0, 5)}...: No stream available`, "error");
+                return;
+            }
+            
+            const pc = createPeerConnection(callerId, myStream);
+            iceCandidatesQueue[callerId] = []; // Reset queue
+
+            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            
+            // Create answer with audio and video
+            const answer = await pc.createAnswer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true
+            });
+            await pc.setLocalDescription(answer);
+
+            log(`📤 Sending answer to ${callerId.substr(0, 5)}... with audio/video`, "info");
+            sendSignal('answer', { target: callerId, sdp: answer });
+
+            // Process any ICE candidates that arrived early
+            processBufferedCandidates(callerId, pc);
+        }
+
+        async function handleAnswer(payload) {
+            const pc = peers[payload.callerId];
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            }
+        }
+
+        function handleIceCandidate(incoming) {
+            const pc = peers[incoming.callerId];
+            if (pc) {
+                if (pc.remoteDescription) {
+                    pc.addIceCandidate(new RTCIceCandidate(incoming.candidate)).catch(e => console.error(e));
+                } else {
+                    if (!iceCandidatesQueue[incoming.callerId]) iceCandidatesQueue[incoming.callerId] = [];
+                    iceCandidatesQueue[incoming.callerId].push(incoming.candidate);
+                }
+            } else {
+                // If PC doesn't exist yet, queue it
+                if (!iceCandidatesQueue[incoming.callerId]) iceCandidatesQueue[incoming.callerId] = [];
+                iceCandidatesQueue[incoming.callerId].push(incoming.candidate);
+            }
+        }
+
+        function processBufferedCandidates(userId, pc) {
+            const queue = iceCandidatesQueue[userId];
+            if (queue && queue.length > 0) {
+                log(`📥 Processing ${queue.length} buffered ICE candidates`);
+                queue.forEach(c => pc.addIceCandidate(new RTCIceCandidate(c)).catch(e => console.error(e)));
+                delete iceCandidatesQueue[userId];
+            }
+        }
+
+        function sendSignal(action, data) {
+            data.action = action;
+            socket.send(JSON.stringify(data));
+        }
+
+        function addVideoStream(video, stream, labelText, id=null) {
+            // Check if wrapper already exists (for remote peers)
+            let wrapper = id ? document.getElementById(id) : null;
+            
+            if (!wrapper) {
+                wrapper = document.createElement('div');
+                wrapper.className = 'video-wrapper';
+                if (id) wrapper.id = id;
+            } else {
+                // If wrapper exists, remove old video and label
+                const oldVideo = wrapper.querySelector('video');
+                const oldLabel = wrapper.querySelector('.label');
+                if (oldVideo) oldVideo.remove();
+                if (oldLabel) oldLabel.remove();
+            }
+
+            const label = document.createElement('div');
+            label.className = 'label';
+            label.innerText = labelText;
+
+            video.srcObject = stream;
+            video.setAttribute('playsinline', 'playsinline');
+            video.setAttribute('autoplay', 'autoplay');
+
+            video.addEventListener('loadedmetadata', () => {
+                video.play().then(() => {
+                    // Log audio track status
+                    if (stream.getAudioTracks().length > 0) {
+                        log(`🔊 Audio ready for ${labelText}`, "success");
+                    }
+                }).catch(e => {
+                    log("❌ AutoPlay Blocked: " + e.message, "error");
+                });
+            });
+
+            wrapper.appendChild(video);
+            wrapper.appendChild(label);
+            
+            // Only append if it's a new wrapper
+            if (!id || !document.getElementById(id)) {
+                videoGrid.append(wrapper);
+            }
+        }
+    </script>
+</body>
+</html>

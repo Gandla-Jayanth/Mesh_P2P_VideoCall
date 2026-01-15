@@ -48,3 +48,6 @@ Thumbs.db
 
 # Netlify
 .netlify/
+
+# Nested folder (old structure)
+Mesh p2p python/
